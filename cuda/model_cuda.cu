@@ -332,7 +332,8 @@ typedef wmma::fragment<wmma::accumulator, 16, 16, 16, float> FragC;
 __global__ void __launch_bounds__(256, 2)
 k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
                 __half *__restrict__ k_g, __half *__restrict__ v_g,
-                float *__restrict__ out, int len, EncFusedWeights W) {
+                float *__restrict__ out, __half *__restrict__ hidden,
+                int len, EncFusedWeights W) {
   cg::grid_group grid = cg::this_grid();
   __shared__ __half buf1[FT][D];      // LN output tile (A operand)
   __shared__ __half buf2[FT][D];      // attention out / MLP hidden chunk
@@ -398,12 +399,11 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
     grid.sync();
     PROF(1 + l * 3);
 
-    // ---- stage B: attention | O-proj | MLP ----
+    // ---- stage B: attention + O-proj on own frames ----
     for (int tile = 0; tile < tiles; tile++) {
       const int fs = f0 + tile * FT;
       const int ft = max(0, min(FT, f1 - fs));
       if (ft > 0) {
-        // sliding-window attention: one warp per (frame, head)
         for (int task = warp; task < ft * H; task += 8) {
           const int f = fs + task / H, h = task % H;
           const int lo = max(0, f - W.win_left[l] + 1);
@@ -433,7 +433,6 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
           for (int s = 16; s > 0; s >>= 1)
             sum += __shfl_xor_sync(0xffffffffu, sum, s);
           const float p = e / sum;
-          // Each lane owns dims (2*lane, 2*lane+1) via one half2 load.
           float acc0 = 0.0f, acc1 = 0.0f;
           for (int s = 0; s < n; s++) {
             const float ps = __shfl_sync(0xffffffffu, p, s);
@@ -453,7 +452,6 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
         for (int f = ft + (int)warp; f < FT; f += 8)
           for (int i = lane; i < D; i += 32) buf2[f][i] = __half(0);
         __syncthreads();
-        // O-proj (tensor cores) + residual into fp32 x
         {
           FragC c[3];
 #pragma unroll
@@ -485,97 +483,100 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
           }
         }
         __syncthreads();
-        // LN2 -> buf1 (fp16)
-        for (int f = warp; f < FT; f += 8) {
-          if (f < ft)
-            warp_ln_unit(x + (size_t)(fs + f) * D, W.ln2_g[l], buf1[f], lane);
-          else
-            for (int i = lane; i < D; i += 32) buf1[f][i] = __half(0);
-        }
-        __syncthreads();
       }
-      // (former pre-MLP phase-lock sync removed: MLP is block-local;
-      // the L2-thrash hypothesis it served was disproven)
-      if (tile == 0) PROF(2 + l * 3);
+    }
+    grid.sync();  // x complete everywhere before cross-block MLP reads
+    PROF(2 + l * 3);
 
-      // MLP: fc1 in 4 column chunks; fc2 accumulated in persistent fragments.
-      // Up to ceil(20 n-tiles / 8 warps) = 3 per warp. ALL loops over
-      // c2/b fragments are compile-time unrolled with clamped indices so the
-      // arrays stay in registers (dynamic indexing puts them on the stack).
-      FragC c2[3];
-#pragma unroll
-      for (int i = 0; i < 3; i++) wmma::fill_fragment(c2[i], 0.0f);
-      for (int cc = 0; cc < 4; cc++) {
-        if (ft > 0) {
-          // fc1 chunk -> gelu -> buf2 (fp16)
-          {
-            FragC c1[3];
-#pragma unroll
-            for (int i = 0; i < 3; i++) wmma::fill_fragment(c1[i], 0.0f);
-            for (int ks = 0; ks < D / 16; ks++) {
-              FragA a;
-              wmma::load_matrix_sync(a, &buf1[0][ks * 16], D);
-              FragB b[3];
-#pragma unroll
-              for (int i = 0; i < 3; i++) {
-                const int nt = min(warp + i * 8, D / 16 - 1);
-                wmma::load_matrix_sync(b[i],
-                                       W.fc1_t[l] + (size_t)(ks * 16) * FF +
-                                           cc * D + nt * 16, FF);
-              }
-#pragma unroll
-              for (int i = 0; i < 3; i++) wmma::mma_sync(c1[i], a, b[i], c1[i]);
-            }
-#pragma unroll
-            for (int i = 0; i < 3; i++) {
-              const int nt = warp + i * 8;
-              if (nt >= D / 16) continue;
-              wmma::store_matrix_sync(&scr[warp][0][0], c1[i], 16,
-                                      wmma::mem_row_major);
-              for (int e = lane; e < 16 * 16; e += 32) {
-                const int r = e / 16, o = nt * 16 + e % 16;
-                buf2[r][o] = __float2half(
-                    (r < ft) ? gelu_d(scr[warp][0][e] + W.fc1_b[l][cc * D + o])
-                             : 0.0f);
-              }
-            }
-          }
-          __syncthreads();
-          // fc2 partial: rows cc*320..+319, accumulate into c2 fragments
-          for (int ks = 0; ks < D / 16; ks++) {
-            FragA a;
-            wmma::load_matrix_sync(a, &buf2[0][ks * 16], D);
-            FragB b[3];
-#pragma unroll
-            for (int i = 0; i < 3; i++) {
-              const int nt = min(warp + i * 8, D / 16 - 1);  // clamped
-              wmma::load_matrix_sync(b[i],
-                                     W.fc2_t[l] +
-                                         (size_t)(cc * D + ks * 16) * D +
-                                         nt * 16, D);
-            }
-#pragma unroll
-            for (int i = 0; i < 3; i++)
-              wmma::mma_sync(c2[i], a, b[i], c2[i]);
-          }
-          __syncthreads();
-        }
+    // ---- stage C: fc1 over (real-tile x column-half) work items ----
+    // All blocks cover ceil(len/16) REAL tiles (no padding waste); a pair of
+    // blocks shares a tile, each computing 640 of the 1280 hidden dims.
+    // GELU'd hidden goes to the global fp16 buffer for stage D.
+    const int n_real = (len + FT - 1) / FT;
+    for (int item = blockIdx.x; item < n_real * 4; item += gridDim.x) {
+      const int t = item >> 2, q = item & 3;  // quarter-granularity items
+      const int fs = t * FT;
+      const int ft = min(FT, len - fs);
+      for (int f = warp; f < FT; f += 8) {
+        if (f < ft)
+          warp_ln_unit(x + (size_t)(fs + f) * D, W.ln2_g[l], buf1[f], lane);
+        else
+          for (int i = lane; i < D; i += 32) buf1[f][i] = __half(0);
       }
-      if (ft > 0) {
+      __syncthreads();
+      {  // one 320-col chunk per item
+        const int col0 = q * D;
+        FragC c1[3];
+#pragma unroll
+        for (int i = 0; i < 3; i++) wmma::fill_fragment(c1[i], 0.0f);
+        for (int ks = 0; ks < D / 16; ks++) {
+          FragA a;
+          wmma::load_matrix_sync(a, &buf1[0][ks * 16], D);
+          FragB b[3];
+#pragma unroll
+          for (int i = 0; i < 3; i++) {
+            const int nt = min(warp + i * 8, D / 16 - 1);
+            wmma::load_matrix_sync(b[i],
+                                   W.fc1_t[l] + (size_t)(ks * 16) * FF + col0 +
+                                       nt * 16, FF);
+          }
+#pragma unroll
+          for (int i = 0; i < 3; i++) wmma::mma_sync(c1[i], a, b[i], c1[i]);
+        }
 #pragma unroll
         for (int i = 0; i < 3; i++) {
           const int nt = warp + i * 8;
           if (nt >= D / 16) continue;
-          wmma::store_matrix_sync(&scr[warp][0][0], c2[i], 16,
+          wmma::store_matrix_sync(&scr[warp][0][0], c1[i], 16,
                                   wmma::mem_row_major);
           for (int e = lane; e < 16 * 16; e += 32) {
             const int r = e / 16, o = nt * 16 + e % 16;
-            if (r < ft)
-              x[(size_t)(fs + r) * D + o] += scr[warp][0][e] + W.fc2_b[l][o];
+            hidden[(size_t)(fs + r) * FF + col0 + o] = __float2half(
+                (r < ft) ? gelu_d(scr[warp][0][e] + W.fc1_b[l][col0 + o])
+                         : 0.0f);
           }
         }
-        __syncthreads();
       }
+      __syncthreads();
+    }
+    grid.sync();  // hidden complete
+
+    // ---- stage D: fc2 over (real-tile x column-half) work items ----
+    for (int item = blockIdx.x; item < n_real * 2; item += gridDim.x) {
+      const int t = item >> 1, hf = item & 1;
+      const int fs = t * FT;
+      const int ft = min(FT, len - fs);
+      const int col0 = hf * (D / 2);  // 160 output cols = 10 n-tiles per half
+      FragC c2[2];
+#pragma unroll
+      for (int i = 0; i < 2; i++) wmma::fill_fragment(c2[i], 0.0f);
+      for (int ks = 0; ks < FF / 16; ks++) {
+        FragA a;
+        wmma::load_matrix_sync(a, hidden + (size_t)fs * FF + ks * 16, FF);
+        FragB b[2];
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+          const int nt = min(warp + i * 8, D / 32 - 1);
+          wmma::load_matrix_sync(b[i],
+                                 W.fc2_t[l] + (size_t)(ks * 16) * D + col0 +
+                                     nt * 16, D);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; i++) wmma::mma_sync(c2[i], a, b[i], c2[i]);
+      }
+#pragma unroll
+      for (int i = 0; i < 2; i++) {
+        const int nt = warp + i * 8;
+        if (nt >= D / 32) continue;
+        wmma::store_matrix_sync(&scr[warp][0][0], c2[i], 16,
+                                wmma::mem_row_major);
+        for (int e = lane; e < 16 * 16; e += 32) {
+          const int r = e / 16, o = col0 + nt * 16 + e % 16;
+          if (r < ft)
+            x[(size_t)(fs + r) * D + o] += scr[warp][0][e] + W.fc2_b[l][o];
+        }
+      }
+      __syncthreads();
     }
     grid.sync();
     PROF(3 + l * 3);
@@ -825,8 +826,10 @@ struct GpuModelImpl {
     // cuBLAS path (fallback also taken when cooperative launch is missing).
     if (fused_ok && !std::getenv("MOONSHINE_NO_FUSED")) {
       __half *qh = (__half *)qb, *kh = (__half *)kb, *vh = (__half *)vb;
+      __half *hidden = (__half *)ffb;  // len*FF halves fit in len*FF floats
       void *args[] = {(void *)&x,  (void *)&qh,  (void *)&kh, (void *)&vh,
-                      (void *)&xn_t, (void *)&len, (void *)&fused_w};
+                      (void *)&xn_t, (void *)&hidden, (void *)&len,
+                      (void *)&fused_w};
       CUDA_CHECK(cudaLaunchCooperativeKernel((void *)k_encoder_fused,
                                              dim3(fused_blocks), dim3(256),
                                              args, 0, nullptr));
