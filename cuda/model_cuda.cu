@@ -358,23 +358,37 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
             for (int i = lane; i < D; i += 32) buf1[f][i] = __half(0);
         }
         __syncthreads();
-        for (int nt = warp; nt < 3 * D / 16; nt += 8) {
-          FragC c;
-          wmma::fill_fragment(c, 0.0f);
+        for (int g = 0; g < 2; g++) {  // 2 groups of 4 n-tiles per warp
+          FragC c[4];
+#pragma unroll
+          for (int i = 0; i < 4; i++) wmma::fill_fragment(c[i], 0.0f);
           for (int ks = 0; ks < D / 16; ks++) {
             FragA a;
-            FragB b;
             wmma::load_matrix_sync(a, &buf1[0][ks * 16], D);
-            wmma::load_matrix_sync(b, W.wqkv_t[l] + (size_t)(ks * 16) * 3 * D +
-                                          nt * 16, 3 * D);
-            wmma::mma_sync(c, a, b, c);
+            FragB b[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+              const int nt = min(warp + (g * 4 + i) * 8, 3 * D / 16 - 1);
+              wmma::load_matrix_sync(b[i],
+                                     W.wqkv_t[l] + (size_t)(ks * 16) * 3 * D +
+                                         nt * 16, 3 * D);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; i++) wmma::mma_sync(c[i], a, b[i], c[i]);
           }
-          wmma::store_matrix_sync(&scr[warp][0][0], c, 16, wmma::mem_row_major);
-          for (int e = lane; e < 16 * 16; e += 32) {
-            const int r = e / 16, o = nt * 16 + e % 16;
-            if (r < ft) {
-              __half *dst = (o < D) ? q_g : (o < 2 * D) ? k_g : v_g;
-              dst[(size_t)(fs + r) * D + (o % D)] = __float2half(scr[warp][0][e]);
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            const int nt = warp + (g * 4 + i) * 8;
+            if (nt >= 3 * D / 16) continue;
+            wmma::store_matrix_sync(&scr[warp][0][0], c[i], 16,
+                                    wmma::mem_row_major);
+            for (int e = lane; e < 16 * 16; e += 32) {
+              const int r = e / 16, o = nt * 16 + e % 16;
+              if (r < ft) {
+                __half *dst = (o < D) ? q_g : (o < 2 * D) ? k_g : v_g;
+                dst[(size_t)(fs + r) * D + (o % D)] =
+                    __float2half(scr[warp][0][e]);
+              }
             }
           }
         }
@@ -440,21 +454,34 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
           for (int i = lane; i < D; i += 32) buf2[f][i] = __half(0);
         __syncthreads();
         // O-proj (tensor cores) + residual into fp32 x
-        for (int nt = warp; nt < D / 16; nt += 8) {
-          FragC c;
-          wmma::fill_fragment(c, 0.0f);
+        {
+          FragC c[3];
+#pragma unroll
+          for (int i = 0; i < 3; i++) wmma::fill_fragment(c[i], 0.0f);
           for (int ks = 0; ks < D / 16; ks++) {
             FragA a;
-            FragB b;
             wmma::load_matrix_sync(a, &buf2[0][ks * 16], D);
-            wmma::load_matrix_sync(b, W.wo_t[l] + (size_t)(ks * 16) * D + nt * 16,
-                                   D);
-            wmma::mma_sync(c, a, b, c);
+            FragB b[3];
+#pragma unroll
+            for (int i = 0; i < 3; i++) {
+              const int nt = min(warp + i * 8, D / 16 - 1);
+              wmma::load_matrix_sync(b[i],
+                                     W.wo_t[l] + (size_t)(ks * 16) * D + nt * 16,
+                                     D);
+            }
+#pragma unroll
+            for (int i = 0; i < 3; i++) wmma::mma_sync(c[i], a, b[i], c[i]);
           }
-          wmma::store_matrix_sync(&scr[warp][0][0], c, 16, wmma::mem_row_major);
-          for (int e = lane; e < 16 * 16; e += 32) {
-            const int r = e / 16, o = nt * 16 + e % 16;
-            if (r < ft) x[(size_t)(fs + r) * D + o] += scr[warp][0][e];
+#pragma unroll
+          for (int i = 0; i < 3; i++) {
+            const int nt = warp + i * 8;
+            if (nt >= D / 16) continue;
+            wmma::store_matrix_sync(&scr[warp][0][0], c[i], 16,
+                                    wmma::mem_row_major);
+            for (int e = lane; e < 16 * 16; e += 32) {
+              const int r = e / 16, o = nt * 16 + e % 16;
+              if (r < ft) x[(size_t)(fs + r) * D + o] += scr[warp][0][e];
+            }
           }
         }
         __syncthreads();
@@ -480,24 +507,36 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
       for (int cc = 0; cc < 4; cc++) {
         if (ft > 0) {
           // fc1 chunk -> gelu -> buf2 (fp16)
-          for (int nt = warp; nt < D / 16; nt += 8) {
-            FragC c;
-            wmma::fill_fragment(c, 0.0f);
+          {
+            FragC c1[3];
+#pragma unroll
+            for (int i = 0; i < 3; i++) wmma::fill_fragment(c1[i], 0.0f);
             for (int ks = 0; ks < D / 16; ks++) {
               FragA a;
-              FragB b;
               wmma::load_matrix_sync(a, &buf1[0][ks * 16], D);
-              wmma::load_matrix_sync(
-                  b, W.fc1_t[l] + (size_t)(ks * 16) * FF + cc * D + nt * 16, FF);
-              wmma::mma_sync(c, a, b, c);
+              FragB b[3];
+#pragma unroll
+              for (int i = 0; i < 3; i++) {
+                const int nt = min(warp + i * 8, D / 16 - 1);
+                wmma::load_matrix_sync(b[i],
+                                       W.fc1_t[l] + (size_t)(ks * 16) * FF +
+                                           cc * D + nt * 16, FF);
+              }
+#pragma unroll
+              for (int i = 0; i < 3; i++) wmma::mma_sync(c1[i], a, b[i], c1[i]);
             }
-            wmma::store_matrix_sync(&scr[warp][0][0], c, 16,
-                                    wmma::mem_row_major);
-            for (int e = lane; e < 16 * 16; e += 32) {
-              const int r = e / 16, o = nt * 16 + e % 16;
-              buf2[r][o] = __float2half(
-                  (r < ft) ? gelu_d(scr[warp][0][e] + W.fc1_b[l][cc * D + o])
-                           : 0.0f);
+#pragma unroll
+            for (int i = 0; i < 3; i++) {
+              const int nt = warp + i * 8;
+              if (nt >= D / 16) continue;
+              wmma::store_matrix_sync(&scr[warp][0][0], c1[i], 16,
+                                      wmma::mem_row_major);
+              for (int e = lane; e < 16 * 16; e += 32) {
+                const int r = e / 16, o = nt * 16 + e % 16;
+                buf2[r][o] = __float2half(
+                    (r < ft) ? gelu_d(scr[warp][0][e] + W.fc1_b[l][cc * D + o])
+                             : 0.0f);
+              }
             }
           }
           __syncthreads();
