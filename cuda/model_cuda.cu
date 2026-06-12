@@ -494,7 +494,8 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
         }
         __syncthreads();
       }
-      grid.sync();
+      // (former pre-MLP phase-lock sync removed: MLP is block-local;
+      // the L2-thrash hypothesis it served was disproven)
       if (tile == 0) PROF(2 + l * 3);
 
       // MLP: fc1 in 4 column chunks; fc2 accumulated in persistent fragments.
@@ -559,7 +560,6 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
           }
           __syncthreads();
         }
-        grid.sync();
       }
       if (ft > 0) {
 #pragma unroll
