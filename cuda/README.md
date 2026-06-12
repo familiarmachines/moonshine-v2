@@ -122,8 +122,13 @@ gap" was an artifact of comparing block-0 clock64 cycle totals (which miss
 launch ramp/tail, ~0.7ms) against wall time. All remaining headroom is inside
 the kernel: attention (~25% of cycles, uncoalesced K/V gathers) and wmma GEMM
 pipelining (no cp.async double-buffering, A-fragments reloaded per n-tile).
-Remains opt-in (`MOONSHINE_FUSED=1`) until those land and it beats cuBLAS at
-pinned clocks.
+As of the fc2 register-promotion commit the fused kernel leads cuBLAS
+(4.67 vs 5.3-5.6 ms/call at pinned 1020 MHz) and is now the DEFAULT.
+`MOONSHINE_NO_FUSED=1` forces the unfused cuBLAS path; the fallback is also
+automatic where cooperative launch is unavailable. Verified before flipping:
+fused and unfused produce byte-identical transcripts on beckett/intent/
+two_cities one-shot (multi-tile long windows) and on the streaming benchmark
+(short windows incl. remainder tiles).
 
 Two infrastructure gotchas worth knowing:
 - **CMake was silently building for compute_52** (`enable_language(CUDA)`

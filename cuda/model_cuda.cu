@@ -736,9 +736,10 @@ struct GpuModelImpl {
                                                   k_encoder_fused, 256, 0);
     fused_blocks = prop.multiProcessorCount * blocks_per_sm;
     fused_ok = coop != 0 && fused_blocks >= 1;
-    if (fused_ok && std::getenv("MOONSHINE_FUSED"))
-      fprintf(stderr, "moonshine-cuda: fused encoder, %d blocks (%d/SM)\n",
-              fused_blocks, blocks_per_sm);
+    if (!fused_ok)
+      fprintf(stderr,
+              "moonshine-cuda: cooperative launch unavailable, falling back "
+              "to unfused encoder\n");
 
     CUDA_CHECK(cudaMalloc(&x, D * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&xn, D * sizeof(float)));
@@ -780,10 +781,10 @@ struct GpuModelImpl {
   // output lands in xn_t. Scratch buffers must hold len*D (ffb: len*FF).
   void encoder_window(float *x, int len, float *xn_t, float *qb, float *kb,
                       float *vb, float *ab, float *ffb) {
-    // The fused megakernel is currently slower than the cuBLAS path
-    // (issue-bound; see README "Encoder kernel findings"). Opt-in until the
-    // tensor-core version lands.
-    if (fused_ok && std::getenv("MOONSHINE_FUSED")) {
+    // Fused tensor-core megakernel: default since it leads cuBLAS ~15% at
+    // pinned clocks (see README). MOONSHINE_NO_FUSED=1 forces the unfused
+    // cuBLAS path (fallback also taken when cooperative launch is missing).
+    if (fused_ok && !std::getenv("MOONSHINE_NO_FUSED")) {
       __half *qh = (__half *)qb, *kh = (__half *)kb, *vh = (__half *)vb;
       void *args[] = {(void *)&x,  (void *)&qh,  (void *)&kh, (void *)&vh,
                       (void *)&xn_t, (void *)&len, (void *)&fused_w};
