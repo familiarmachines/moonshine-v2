@@ -471,8 +471,11 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
       if (tile == 0) PROF(2 + l * 3);
 
       // MLP: fc1 in 4 column chunks; fc2 accumulated in persistent fragments.
-      FragC c2[3];  // up to ceil(20 n-tiles / 8 warps) = 3 per warp
-      const int nt2_count = (D / 16 - warp + 7) / 8;
+      // Up to ceil(20 n-tiles / 8 warps) = 3 per warp. ALL loops over
+      // c2/b fragments are compile-time unrolled with clamped indices so the
+      // arrays stay in registers (dynamic indexing puts them on the stack).
+      FragC c2[3];
+#pragma unroll
       for (int i = 0; i < 3; i++) wmma::fill_fragment(c2[i], 0.0f);
       for (int cc = 0; cc < 4; cc++) {
         if (ft > 0) {
@@ -499,24 +502,31 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
           }
           __syncthreads();
           // fc2 partial: rows cc*320..+319, accumulate into c2 fragments
-          for (int i = 0; i < nt2_count; i++) {
-            const int nt = warp + i * 8;
-            for (int ks = 0; ks < D / 16; ks++) {
-              FragA a;
-              FragB b;
-              wmma::load_matrix_sync(a, &buf2[0][ks * 16], D);
-              wmma::load_matrix_sync(
-                  b, W.fc2_t[l] + (size_t)(cc * D + ks * 16) * D + nt * 16, D);
-              wmma::mma_sync(c2[i], a, b, c2[i]);
+          for (int ks = 0; ks < D / 16; ks++) {
+            FragA a;
+            wmma::load_matrix_sync(a, &buf2[0][ks * 16], D);
+            FragB b[3];
+#pragma unroll
+            for (int i = 0; i < 3; i++) {
+              const int nt = min(warp + i * 8, D / 16 - 1);  // clamped
+              wmma::load_matrix_sync(b[i],
+                                     W.fc2_t[l] +
+                                         (size_t)(cc * D + ks * 16) * D +
+                                         nt * 16, D);
             }
+#pragma unroll
+            for (int i = 0; i < 3; i++)
+              wmma::mma_sync(c2[i], a, b[i], c2[i]);
           }
           __syncthreads();
         }
         grid.sync();
       }
       if (ft > 0) {
-        for (int i = 0; i < nt2_count; i++) {
+#pragma unroll
+        for (int i = 0; i < 3; i++) {
           const int nt = warp + i * 8;
+          if (nt >= D / 16) continue;
           wmma::store_matrix_sync(&scr[warp][0][0], c2[i], 16,
                                   wmma::mem_row_major);
           for (int e = lane; e < 16 * 16; e += 32) {
