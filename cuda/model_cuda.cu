@@ -398,11 +398,17 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
           const int n = hi - lo + 1;
           float score = -1e30f;
           if (lane < n) {
-            const __half *qh = q_g + (size_t)f * D + h * HD;
-            const __half *kh = k_g + (size_t)(lo + lane) * D + h * HD;
+            const __half2 *qh =
+                (const __half2 *)(q_g + (size_t)f * D + h * HD);
+            const __half2 *kh =
+                (const __half2 *)(k_g + (size_t)(lo + lane) * D + h * HD);
             float acc = 0.0f;
-            for (int d = 0; d < HD; d++)
-              acc += __half2float(qh[d]) * __half2float(kh[d]);
+#pragma unroll
+            for (int d = 0; d < HD / 2; d++) {
+              const float2 qq = __half22float2(qh[d]);
+              const float2 kk = __half22float2(kh[d]);
+              acc += qq.x * kk.x + qq.y * kk.y;
+            }
             score = acc * 0.15811388f;
           }
           float mx = score;
@@ -413,16 +419,21 @@ k_encoder_fused(float *__restrict__ x, __half *__restrict__ q_g,
           for (int s = 16; s > 0; s >>= 1)
             sum += __shfl_xor_sync(0xffffffffu, sum, s);
           const float p = e / sum;
+          // Each lane owns dims (2*lane, 2*lane+1) via one half2 load.
           float acc0 = 0.0f, acc1 = 0.0f;
           for (int s = 0; s < n; s++) {
             const float ps = __shfl_sync(0xffffffffu, p, s);
-            const __half *vh = v_g + (size_t)(lo + s) * D + h * HD;
-            acc0 += ps * __half2float(vh[lane]);
-            if (lane < HD - 32) acc1 += ps * __half2float(vh[32 + lane]);
+            if (lane < HD / 2) {
+              const float2 vv = __half22float2(*(const __half2 *)(
+                  v_g + (size_t)(lo + s) * D + h * HD + 2 * lane));
+              acc0 += ps * vv.x;
+              acc1 += ps * vv.y;
+            }
           }
-          buf2[task / H][h * HD + lane] = __float2half(acc0);
-          if (lane < HD - 32)
-            buf2[task / H][h * HD + 32 + lane] = __float2half(acc1);
+          if (lane < HD / 2) {
+            buf2[task / H][h * HD + 2 * lane] = __float2half(acc0);
+            buf2[task / H][h * HD + 2 * lane + 1] = __float2half(acc1);
+          }
         }
         __syncthreads();
         for (int f = ft + (int)warp; f < FT; f += 8)
