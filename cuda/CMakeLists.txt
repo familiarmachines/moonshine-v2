@@ -63,10 +63,33 @@ if(CMAKE_CUDA_COMPILER)
   )
   target_link_libraries(enc-only PRIVATE CUDA::cublas CUDA::cudart)
 
+  # Live microphone transcriber. ALSA is optional: with it, mic capture is
+  # available; without it the target still builds as a WAV-driven tester.
+  add_executable(moonshine-mic
+    main-mic.cpp
+    model_cuda.cu
+    model.cpp
+    safetensors.cpp
+    tokenizer.cpp
+    wav.cpp
+  )
+  target_link_libraries(moonshine-mic PRIVATE CUDA::cublas CUDA::cudart)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(ALSA alsa)
+  endif()
+  if(ALSA_FOUND)
+    target_compile_definitions(moonshine-mic PRIVATE MOONSHINE_HAVE_ALSA)
+    target_include_directories(moonshine-mic PRIVATE ${ALSA_INCLUDE_DIRS})
+    target_link_libraries(moonshine-mic PRIVATE ${ALSA_LIBRARIES})
+  else()
+    message(STATUS "ALSA not found - moonshine-mic builds WAV-only (no mic)")
+  endif()
+
   # Cooperative-groups grid sync in the fused encoder needs relocatable
   # device code.
-  set_target_properties(moonshine-cuda moonshine-bench enc-only PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
+  set_target_properties(moonshine-cuda moonshine-bench enc-only moonshine-mic
+    PROPERTIES CUDA_SEPARABLE_COMPILATION ON
   )
 else()
   message(STATUS "No CUDA compiler found - building CPU reference only")
