@@ -319,6 +319,14 @@ int main(int argc, char *argv[]) {
     Tokenizer tokenizer((model_dir + "/tokenizer.bin").c_str());
     GpuModel model(weights);
 
+    // Make it obvious the encoder+decoder run on the GPU.
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess)
+      fprintf(stderr, "CUDA device: %s (%d SMs, cc %d.%d) — %s encoder\n",
+              prop.name, prop.multiProcessorCount, prop.major, prop.minor,
+              getenv("MOONSHINE_NO_FUSED") ? "unfused cuBLAS"
+                                           : "fused tensor-core");
+
     // Warm up the GPU pipeline (first cooperative launch is slow).
     {
       GpuStream warm(model, 2.5f);
